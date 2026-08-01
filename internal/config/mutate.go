@@ -91,18 +91,30 @@ func (c *Config) RenameHost(envName, oldAddr, newAddr string) error {
 		return err
 	}
 	h.Host = newAddr
+	// 跳板机换了地址, 引用也得跟着走, 否则下次 Resolve 会说跳板机不在列表里。
+	if e.Jump == oldAddr {
+		e.Jump = newAddr
+	}
 	return nil
 }
 
-// RemoveHost 从环境里删一台机器。
+// RemoveHost 从环境里删一台机器。删掉还有别人依赖的跳板机会让整个环境连不上,
+// 所以要求先显式取消跳板机设置。
 func (c *Config) RemoveHost(envName, addr string) error {
 	e := c.FindEnv(envName)
 	if e == nil {
 		return fmt.Errorf("不存在名为 %q 的环境 (imgm env ls 查看已有环境)", envName)
 	}
+	if e.Jump == addr && len(e.Hosts) > 1 {
+		return fmt.Errorf("%s 是环境 %q 的跳板机, 其余 %d 台机器要靠它中转; 先执行 imgm env set %s --jump \"\" 或换一台跳板机",
+			addr, envName, len(e.Hosts)-1, envName)
+	}
 	for i := range e.Hosts {
 		if e.Hosts[i].Host == addr {
 			e.Hosts = append(e.Hosts[:i], e.Hosts[i+1:]...)
+			if e.Jump == addr {
+				e.Jump = ""
+			}
 			return nil
 		}
 	}

@@ -18,9 +18,35 @@ type Target struct {
 	RemoteTmp string
 	Hosts     []Host // Port/User/KeyFile(已展开 ~)/Password 全部填满
 
+	// Jump 指向 Hosts 里充当跳板机的那一台 (没设跳板机则为 nil)。
+	// 它自身也是部署目标, 所以是 Hosts 的成员而不是独立的一台机器。
+	Jump *Host
+
 	// PlatformIsDefault 表示 Platform 就是内置默认的 linux/amd64。
 	// 用于在本机架构与之不符时提示 —— 选了非默认架构就说明已经想过这事了。
 	PlatformIsDefault bool
+}
+
+// JumpFor 返回连到 h 时该走的跳板机; 直连返回 nil。
+// 跳板机连它自己当然是直连, 否则会绕着自己兜一圈。
+func (t *Target) JumpFor(h Host) *Host {
+	if t.Jump == nil || t.Jump.Host == h.Host {
+		return nil
+	}
+	return t.Jump
+}
+
+// NeedsJump 报告是否真的有机器要中转。只有跳板机自己一台时不必建隧道。
+func (t *Target) NeedsJump() bool {
+	if t.Jump == nil {
+		return false
+	}
+	for _, h := range t.Hosts {
+		if h.Host != t.Jump.Host {
+			return true
+		}
+	}
+	return false
 }
 
 var (
@@ -57,6 +83,14 @@ func ValidateEnv(e *Environment) error {
 	if e.ContainerdNamespace != "" && !namespaceRe.MatchString(e.ContainerdNamespace) {
 		return fmt.Errorf("环境 %q 的 containerd_namespace 非法: %q (只能含字母数字和 . _ -)",
 			e.Name, e.ContainerdNamespace)
+	}
+	// 这里只查地址本身是否合法。跳板机是否真在 hosts 里由 Resolve 判断 ——
+	// ValidateEnv 被 env ls 对每个环境调用, 不该因为别的环境的机器列表而报错。
+	if e.Jump != "" {
+		probe := Host{Host: e.Jump}
+		if err := ValidateHost(&probe); err != nil {
+			return fmt.Errorf("环境 %q 的跳板机地址非法: %w", e.Name, err)
+		}
 	}
 	return nil
 }
@@ -131,6 +165,20 @@ func (c *Config) Resolve(name string) (*Target, error) {
 			return nil, err
 		}
 		t.Hosts = append(t.Hosts, h)
+	}
+
+	// 必须在 append 结束后再取指针, 否则扩容会让 Jump 指向旧数组。
+	if e.Jump != "" {
+		for i := range t.Hosts {
+			if t.Hosts[i].Host == e.Jump {
+				t.Jump = &t.Hosts[i]
+				break
+			}
+		}
+		if t.Jump == nil {
+			return nil, fmt.Errorf("环境 %q 的跳板机 %s 不在它的机器列表里 (imgm host add %s -e %s 加进来, 或 imgm env set %s --jump \"\" 取消)",
+				e.Name, e.Jump, e.Jump, e.Name, e.Name)
+		}
 	}
 	return t, nil
 }

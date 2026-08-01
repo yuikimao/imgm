@@ -20,14 +20,15 @@ type Client struct {
 	sftp *sftp.Client
 }
 
-// Dial 建立 SSH 连接, 使用默认超时。
-func Dial(cfg config.Host) (*Client, error) {
-	return DialTimeout(cfg, 15*time.Second)
+// Dial 建立 SSH 连接, 使用默认超时。via 为 nil 表示直连。
+func Dial(cfg config.Host, via *Jump) (*Client, error) {
+	return DialTimeout(cfg, via, 15*time.Second)
 }
 
-// DialTimeout 建立 SSH 连接。私钥优先，回退密码。
-func DialTimeout(cfg config.Host, timeout time.Duration) (*Client, error) {
-	var authMethods []ssh.AuthMethod
+// authMethods 组装认证方式。私钥优先, 回退密码 —— 所以从密码切密钥时
+// 两个都填着最稳, 切换失败还连得上。
+func authMethods(cfg config.Host) ([]ssh.AuthMethod, error) {
+	var methods []ssh.AuthMethod
 
 	if cfg.KeyFile != "" {
 		key, err := os.ReadFile(cfg.KeyFile)
@@ -38,26 +39,132 @@ func DialTimeout(cfg config.Host, timeout time.Duration) (*Client, error) {
 		if err != nil {
 			return nil, fmt.Errorf("解析私钥 %s 失败: %w", cfg.KeyFile, err)
 		}
-		authMethods = append(authMethods, ssh.PublicKeys(signer))
+		methods = append(methods, ssh.PublicKeys(signer))
 	}
 	if cfg.Password != "" {
-		authMethods = append(authMethods, ssh.Password(cfg.Password))
+		methods = append(methods, ssh.Password(cfg.Password))
 	}
-	if len(authMethods) == 0 {
+	if len(methods) == 0 {
 		return nil, fmt.Errorf("未提供任何 SSH 认证方式")
 	}
+	return methods, nil
+}
 
-	clientCfg := &ssh.ClientConfig{
+func clientConfig(cfg config.Host, timeout time.Duration) (*ssh.ClientConfig, error) {
+	methods, err := authMethods(cfg)
+	if err != nil {
+		return nil, err
+	}
+	return &ssh.ClientConfig{
 		User:            cfg.User,
-		Auth:            authMethods,
+		Auth:            methods,
 		HostKeyCallback: ssh.InsecureIgnoreHostKey(), // 内网迁移工具，忽略主机指纹校验
 		Timeout:         timeout,
+	}, nil
+}
+
+// Jump 是一条已建立到跳板机的 SSH 连接, 可被多个目标主机共享。
+// ssh.Client 的 Dial 是并发安全的, 所以 env check 的并行探测能共用一条 ——
+// 每台机器各拨一次跳板机的话, 短时间内的 N 次认证很容易撞上 sshd 默认的
+// MaxStartups 10:30:100 被随机丢连接, 或者触发 fail2ban。
+type Jump struct {
+	client *ssh.Client
+	addr   string // 仅用于错误信息
+}
+
+// DialJump 连上跳板机。返回的 Jump 由调用方负责 Close。
+func DialJump(cfg config.Host, timeout time.Duration) (*Jump, error) {
+	clientCfg, err := clientConfig(cfg, timeout)
+	if err != nil {
+		return nil, err
+	}
+	addr := net.JoinHostPort(cfg.Host, strconv.Itoa(cfg.Port))
+	client, err := ssh.Dial("tcp", addr, clientCfg)
+	if err != nil {
+		return nil, fmt.Errorf("连接跳板机 %s 失败: %w", addr, err)
+	}
+	return &Jump{client: client, addr: addr}, nil
+}
+
+func (j *Jump) Close() error {
+	if j == nil || j.client == nil {
+		return nil
+	}
+	return j.client.Close()
+}
+
+// dialVia 经跳板机建立到 addr 的 SSH 连接。
+//
+// ssh.Client.Dial 返回的 conn 不支持 SetDeadline, ClientConfig.Timeout 也
+// 管不到隧道内的握手, 所以超时只能在外面兜一层。
+func dialVia(via *Jump, addr string, clientCfg *ssh.ClientConfig, timeout time.Duration) (*ssh.Client, error) {
+	type dialed struct {
+		c   *ssh.Client
+		err error
+	}
+	ch := make(chan dialed, 1) // 有缓冲: 超时返回后生产者也不会阻塞在这
+
+	go func() {
+		conn, err := via.client.Dial("tcp", addr)
+		if err != nil {
+			ch <- dialed{err: err}
+			return
+		}
+		cc, chans, reqs, err := ssh.NewClientConn(conn, addr, clientCfg)
+		if err != nil {
+			conn.Close()
+			ch <- dialed{err: err}
+			return
+		}
+		ch <- dialed{c: ssh.NewClient(cc, chans, reqs)}
+	}()
+
+	select {
+	case r := <-ch:
+		if r.err != nil {
+			return nil, jumpError(via, addr, r.err)
+		}
+		return r.c, nil
+	case <-time.After(timeout):
+		// 迟到的连接必须收掉, 否则泄漏一个 ssh.Client 和它的 fd。
+		go func() {
+			if r := <-ch; r.c != nil {
+				r.c.Close()
+			}
+		}()
+		return nil, fmt.Errorf("经跳板机 %s 连接 %s 超时 (%s)", via.addr, addr, timeout)
+	}
+}
+
+// jumpError 给隧道内的错误加上路由前缀。原始报错只提内网 IP, 用户会以为
+// 是自己的机器连不上, 而实际上是跳板机到内网那一段的问题。
+func jumpError(via *Jump, addr string, err error) error {
+	if strings.Contains(err.Error(), "administratively prohibited") {
+		return fmt.Errorf("跳板机 %s 不允许端口转发, 无法中转到 %s: 需要它的 sshd_config 里 AllowTcpForwarding yes (原始错误: %w)",
+			via.addr, addr, err)
+	}
+	return fmt.Errorf("经跳板机 %s 连接 %s 失败 (地址在跳板机上解析, 端口是目标机的): %w", via.addr, addr, err)
+}
+
+// DialTimeout 建立 SSH 连接。via 非 nil 时经跳板机中转。
+func DialTimeout(cfg config.Host, via *Jump, timeout time.Duration) (*Client, error) {
+	clientCfg, err := clientConfig(cfg, timeout)
+	if err != nil {
+		return nil, err
 	}
 
 	addr := net.JoinHostPort(cfg.Host, strconv.Itoa(cfg.Port))
-	sshClient, err := ssh.Dial("tcp", addr, clientCfg)
+	var sshClient *ssh.Client
+	if via != nil {
+		sshClient, err = dialVia(via, addr, clientCfg, timeout)
+	} else {
+		sshClient, err = ssh.Dial("tcp", addr, clientCfg)
+		if err != nil {
+			err = fmt.Errorf("SSH 连接 %s 失败: %w", addr, err)
+		}
+	}
 	if err != nil {
-		return nil, fmt.Errorf("SSH 连接 %s 失败: %w", addr, err)
+		return nil, err
 	}
 
 	// 默认 SFTP 每个包都要等一次往返确认, 70 MiB 就是两千多次串行 RTT ——

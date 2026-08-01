@@ -51,7 +51,8 @@ type Environment struct {
 	Platform            string    `yaml:"platform,omitempty"`
 	ContainerdNamespace string    `yaml:"containerd_namespace,omitempty"` // 仅 type=k8s 生效
 	RemoteTmp           string    `yaml:"remote_tmp,omitempty"`
-	SSH                 SSHParams `yaml:"ssh,omitempty"` // 该环境所有机器共享的默认 SSH 参数
+	Jump                string    `yaml:"jump,omitempty"` // 跳板机地址, 必须是本环境 hosts 里的一台
+	SSH                 SSHParams `yaml:"ssh,omitempty"`  // 该环境所有机器共享的默认 SSH 参数
 	Hosts               []Host    `yaml:"hosts,omitempty"`
 }
 
