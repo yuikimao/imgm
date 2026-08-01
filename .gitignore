@@ -1,0 +1,10 @@
+# 编译产物
+/imgm
+
+# 本地工具配置
+/.claude/
+/.idea/
+
+# 测试产生的 tar 与输出目录
+*.tar
+/output/
