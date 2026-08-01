@@ -91,7 +91,7 @@ func newHostAddCmd() *cobra.Command {
 			stdout := cmd.OutOrStdout()
 			fmt.Fprintf(stdout, "✔ 已向环境 %s 添加 %d 台机器 (共 %d 台)\n\n", envName, len(addrs), len(e.Hosts))
 			printHostTable(stdout, cfg, e, hostTableOpts{Marks: marks})
-			fmt.Fprintf(stdout, "\n下一步: imgm env check %s\n", envName)
+			printDeploySteps(stdout, envName, envPlatform(cfg, e))
 			return nil
 		},
 	}

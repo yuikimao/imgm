@@ -16,6 +16,8 @@ var (
 	hostRangeRe = regexp.MustCompile(`^(\d{1,3})\.(\d{1,3})\.(\d{1,3})\.(\d{1,3})-(\d{1,3})$`)
 	// fullPairRe 只用来给 10.0.0.11-10.0.0.14 这种写法一个明确的报错。
 	fullPairRe = regexp.MustCompile(`^\d{1,3}(\.\d{1,3}){3}-\d{1,3}(\.\d{1,3}){3}$`)
+	// ipv4Re 切出前三段网段, 用于编一个跟用户网络同段的示例地址。
+	ipv4Re = regexp.MustCompile(`^(\d{1,3}\.\d{1,3}\.\d{1,3})\.\d{1,3}$`)
 )
 
 // rangeExpansion 记录一次展开, 用于向用户回显"你写的这个变成了哪几台"。
