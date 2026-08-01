@@ -26,6 +26,7 @@ type envSpec struct {
 	key       *string
 	password  *string
 	remoteTmp *string
+	jump      *string
 	yes       bool
 }
 
@@ -36,9 +37,10 @@ func (s *envSpec) registerFields(fs *pflag.FlagSet) {
 	s.namespace = fs.String("namespace", "", "containerd 命名空间, 仅 k8s 生效 (缺省 k8s.io)")
 	s.user = fs.String("user", "", "SSH 用户")
 	s.port = fs.Int("port", 0, "SSH 端口 (缺省 22)")
-	s.key = fs.String("key", "", "SSH 私钥路径, 如 ~/.ssh/id_rsa")
+	s.key = fs.String("key", "", "本机 SSH 私钥路径, 如 ~/.ssh/id_rsa (公钥需已在目标机 authorized_keys 中)")
 	s.password = fs.String("password", "", "SSH 密码 (将明文存入配置)")
 	s.remoteTmp = fs.String("remote-tmp", "", "远程临时目录 (缺省 /tmp)")
+	s.jump = fs.String("jump", "", "跳板机地址, 必须是本环境的机器之一 (空值表示不用跳板机)")
 }
 
 func (s *envSpec) registerYes(fs *pflag.FlagSet) {
@@ -132,6 +134,9 @@ func newEnvSetCmd() *cobra.Command {
 			if given(fs, "remote-tmp") {
 				after.RemoteTmp = *spec.remoteTmp
 			}
+			if given(fs, "jump") {
+				after.Jump = *spec.jump
+			}
 			if given(fs, "user") {
 				after.SSH.User = *spec.user
 			}
@@ -150,6 +155,9 @@ func newEnvSetCmd() *cobra.Command {
 				return nil
 			}
 			if err := config.ValidateEnv(&after); err != nil {
+				return err
+			}
+			if err := checkJumpMember(after.Jump, hostAddrs(after.Hosts), after.Name); err != nil {
 				return err
 			}
 			if after.Type == config.TypeDocker && after.ContainerdNamespace != "" {
@@ -182,7 +190,30 @@ func newEnvSetCmd() *cobra.Command {
 func envUnchanged(a, b *config.Environment) bool {
 	return a.Type == b.Type && a.Platform == b.Platform &&
 		a.ContainerdNamespace == b.ContainerdNamespace &&
-		a.RemoteTmp == b.RemoteTmp && a.SSH == b.SSH
+		a.RemoteTmp == b.RemoteTmp && a.Jump == b.Jump && a.SSH == b.SSH
+}
+
+// hostAddrs 取出机器地址列表, 供跳板机归属校验用。
+func hostAddrs(hosts []config.Host) []string {
+	addrs := make([]string, 0, len(hosts))
+	for _, h := range hosts {
+		addrs = append(addrs, h.Host)
+	}
+	return addrs
+}
+
+// checkJumpMember 校验跳板机确实是本环境的机器之一。空值 (不用跳板机) 直接通过。
+// 环境还没有机器时不拦 —— env add 允许先建空骨架, 之后 host add 补机器。
+func checkJumpMember(jump string, addrs []string, envName string) error {
+	if jump == "" || len(addrs) == 0 {
+		return nil
+	}
+	for _, a := range addrs {
+		if a == jump {
+			return nil
+		}
+	}
+	return fmt.Errorf("跳板机 %s 不是环境 %q 的机器 (可选: %s)", jump, envName, strings.Join(addrs, ", "))
 }
 
 // printEnvDiff 打印 旧 → 新。只列真的变了的字段。密码永不出明文。
@@ -200,6 +231,7 @@ func printEnvDiff(out io.Writer, before, after *config.Environment) {
 	row("架构", before.Platform, after.Platform)
 	row("命名空间", before.ContainerdNamespace, after.ContainerdNamespace)
 	row("远程临时", before.RemoteTmp, after.RemoteTmp)
+	row("跳板机", before.Jump, after.Jump)
 	row("默认用户", before.SSH.User, after.SSH.User)
 	row("默认端口", portText(before.SSH.Port), portText(after.SSH.Port))
 	row("默认私钥", before.SSH.KeyFile, after.SSH.KeyFile)
@@ -215,6 +247,14 @@ func printEnvDiff(out io.Writer, before, after *config.Environment) {
 
 // padCJK 按终端显示宽度右填充。tabwriter 按 rune 计数, 会把中文列算窄一半。
 func padCJK(s string, width int) string {
+	if w := displayWidth(s); w < width {
+		return s + strings.Repeat(" ", width-w)
+	}
+	return s
+}
+
+// displayWidth 估算终端显示宽度, 中日韩字符按两格算。
+func displayWidth(s string) int {
 	w := 0
 	for _, r := range s {
 		if r > 0x2000 {
@@ -223,10 +263,7 @@ func padCJK(s string, width int) string {
 			w++
 		}
 	}
-	if w >= width {
-		return s
-	}
-	return s + strings.Repeat(" ", width-w)
+	return w
 }
 
 func portText(p int) string {
@@ -241,6 +278,26 @@ func maskPassword(s string) string {
 		return ""
 	}
 	return "****(已设置)"
+}
+
+// askJump 问哪台机器是跳板机。留空表示所有机器都能直连。
+func askJump(p *Prompter, hosts []string) (string, error) {
+	fmt.Fprintf(p.out, "\n如果这些机器只能经其中一台中转, 输入那一台的地址 (直接回车表示都能直连)\n  可选: %s\n", strings.Join(hosts, ", "))
+	for {
+		s, err := p.LineOptional("跳板机")
+		if err != nil {
+			return "", err
+		}
+		if s == "" {
+			return "", nil
+		}
+		for _, h := range hosts {
+			if h == s {
+				return s, nil
+			}
+		}
+		fmt.Fprintf(p.out, "  %s 不在上面的机器里, 重新输入或直接回车跳过\n", s)
+	}
 }
 
 // upsertEnv 是 init 与 env add 的共同实现。
@@ -298,6 +355,18 @@ func upsertEnv(cmd *cobra.Command, p *Prompter, spec *envSpec) error {
 		hosts = expanded
 	}
 
+	// 跳板机必须在机器收集完之后问: e.Hosts 要到函数末尾才填, 这里只有局部的 hosts。
+	if given(fs, "jump") {
+		e.Jump = *spec.jump
+		if err := checkJumpMember(e.Jump, hosts, spec.name); err != nil {
+			return err
+		}
+	} else if len(hosts) > 1 && p.tty {
+		if e.Jump, err = askJump(p, hosts); err != nil {
+			return err
+		}
+	}
+
 	// 有机器就必须有账号; 没机器 (env add 只建骨架) 则账号也可以后补。
 	if len(hosts) > 0 || given(fs, "user") {
 		if given(fs, "user") {
@@ -321,11 +390,15 @@ func upsertEnv(cmd *cobra.Command, p *Prompter, spec *envSpec) error {
 			e.SSH.Password = *spec.password
 		default:
 			// 内网机器多数只有密码, 所以直接问密码; 空输入才转密钥。
-			if e.SSH.Password, err = p.SecretOptional("SSH 密码 (直接回车则用密钥认证)"); err != nil {
+			if e.SSH.Password, err = p.SecretOptional("SSH 密码 (直接回车改用密钥认证)"); err != nil {
 				return err
 			}
 			if e.SSH.Password == "" {
-				if e.SSH.KeyFile, err = p.Line("私钥路径", "~/.ssh/id_rsa"); err != nil {
+				// 说清私钥在本机、公钥要事先在目标机上 —— imgm 只读私钥,
+				// 不会把公钥装到目标机去 (对远程机器只有查看权限)。
+				fmt.Fprintf(out, "\n使用密钥认证。此处填写本机私钥路径, imgm 仅读取该文件。\n")
+				fmt.Fprintf(out, "前提: 对应公钥需已配置在目标机的 ~/.ssh/authorized_keys 中。\n")
+				if e.SSH.KeyFile, err = p.Line("本机私钥路径", "~/.ssh/id_rsa"); err != nil {
 					return err
 				}
 			}
@@ -356,13 +429,89 @@ func upsertEnv(cmd *cobra.Command, p *Prompter, spec *envSpec) error {
 	}
 
 	stdout := cmd.OutOrStdout()
-	fmt.Fprintf(stdout, "\n✔ 已创建环境 %s (%s, %s, %d 台机器)\n", e.Name, e.Type, orDefault(e.Platform, config.DefaultPlatform), len(e.Hosts))
-	if len(e.Hosts) == 0 {
-		fmt.Fprintf(stdout, "下一步: imgm host add <ip> -e %s\n", e.Name)
-	} else {
-		fmt.Fprintf(stdout, "下一步: imgm env check %s\n", e.Name)
-	}
+	platform := envPlatform(cfg, &e)
+	fmt.Fprintf(stdout, "\n✔ 已创建环境 %s (%s, %s, %d 台机器)\n", e.Name, e.Type, platform, len(e.Hosts))
+	printNextSteps(stdout, e, platform)
 	return nil
+}
+
+// cmdSection 打印一组「命令 # 说明」。用 padCJK 而不是 tabwriter:
+// tabwriter 按 rune 计数, 含中文的列会算窄一半, 注释就对不齐。
+func cmdSection(out io.Writer, title string, rows [][2]string) {
+	fmt.Fprintf(out, "\n%s\n", title)
+	w := 0
+	for _, r := range rows {
+		if n := displayWidth(r[0]); n > w {
+			w = n
+		}
+	}
+	for _, r := range rows {
+		fmt.Fprintf(out, "  %s   # %s\n", padCJK(r[0], w), r[1])
+	}
+}
+
+// envPlatform 解析环境实际生效的架构: 环境 → 全局默认 → 内置默认。
+func envPlatform(cfg *config.Config, e *config.Environment) string {
+	return orDefault(e.Platform, orDefault(cfg.Defaults.Platform, config.DefaultPlatform))
+}
+
+// printDeploySteps 说明「验证 → 分发」这条主线。host add 之后也要打一次 ——
+// 新机器加进来了, 用户接着要问的就是怎么把镜像发过去。
+// 架构那句必须带上: 在 Mac 上构建 x86 镜像是这个工具最常被误解的地方,
+// 用户会以为 build 跟随本机架构, 于是绕去手写 --platform。
+func printDeploySteps(out io.Writer, env, platform string) {
+	cmdSection(out, "下一步:", [][2]string{
+		{"imgm env check " + env, "1. 验证所有机器可连接"},
+		{fmt.Sprintf("imgm pull -e %s nginx:1.25", env), "2. 从 registry 拉取并分发"},
+		{fmt.Sprintf("imgm build -e %s -t myapp:1.0 .", env), "或: 构建本地应用并分发"},
+		{fmt.Sprintf("imgm push -e %s myapp:1.0", env), "或: 分发本机已有镜像"},
+	})
+	fmt.Fprintf(out, "  拉取与构建均按环境架构 %s 进行, 与本机架构无关。\n", platform)
+}
+
+// printNextSteps 把建完环境后该执行的命令直接拼好。新用户不知道 env check
+// 的存在, 更不知道 --jump 和账号继承 —— 让他们去翻 --help 才发现, 不如这里
+// 就按「验证 → 分发 → 日常维护」的顺序列出来。
+func printNextSteps(out io.Writer, e config.Environment, platform string) {
+	if len(e.Hosts) == 0 {
+		fmt.Fprintf(out, "\n下一步:\n  imgm host add <ip> -e %s   # 添加机器, 账号继承本环境配置\n", e.Name)
+		return
+	}
+
+	n := e.Name
+	addr := exampleAddr(e.Hosts)
+	printDeploySteps(out, n, platform)
+	cmdSection(out, "机器管理 (账号默认继承本环境配置):", [][2]string{
+		{fmt.Sprintf("imgm host ls -e %s", n), "查看机器列表"},
+		{fmt.Sprintf("imgm host add %s -e %s", addr, n), "添加单台"},
+		{fmt.Sprintf("imgm host add %s-23 -e %s", addr, n), "批量添加 (20,21,22,23)"},
+		{fmt.Sprintf("imgm host rm %s -e %s", addr, n), "移除机器"},
+	})
+	cmdSection(out, "账号配置 (机器级设置优先于环境级):", [][2]string{
+		{fmt.Sprintf("imgm env set %s --password '<密码>'", n), "修改本环境默认账号"},
+		{fmt.Sprintf("imgm host add %s -e %s --password '<密码>'", addr, n), "添加时单独指定"},
+		{fmt.Sprintf("imgm host set %s -e %s --password '<密码>'", addr, n), "为已有机器单独设置"},
+		{fmt.Sprintf("imgm host set %s -e %s --password ''", addr, n), "清除单独设置, 恢复继承"},
+	})
+
+	if e.Jump == "" && len(e.Hosts) > 1 {
+		fmt.Fprintf(out, "\n当前为直连模式: 每台机器都从本机直接连接。\n")
+		fmt.Fprintf(out, "若部分机器只能经其中一台中转, 设置跳板机:\n")
+		fmt.Fprintf(out, "  imgm env set %s --jump <跳板机地址>\n", e.Name)
+	}
+}
+
+// exampleAddr 拿已有机器的网段编一个示例地址, 让 host add 的例子看着像
+// 用户自己的网络而不是文档里的 10.0.0.x。主机名或解析不出网段时退回通用例子。
+func exampleAddr(hosts []config.Host) string {
+	if len(hosts) == 0 {
+		return "10.0.0.20"
+	}
+	m := ipv4Re.FindStringSubmatch(hosts[0].Host)
+	if m == nil {
+		return "10.0.0.20"
+	}
+	return m[1] + ".20"
 }
 
 // noticePlaintextPassword 只告知, 不拦。
@@ -409,7 +558,7 @@ func newEnvLsCmd() *cobra.Command {
 			fmt.Fprintln(tw, "NAME\tTYPE\tPLATFORM\tHOSTS")
 			for i := range cfg.Environments {
 				e := &cfg.Environments[i]
-				platform := orDefault(e.Platform, orDefault(cfg.Defaults.Platform, config.DefaultPlatform))
+				platform := envPlatform(cfg, e)
 				note := ""
 				if err := config.ValidateEnv(e); err != nil {
 					note = "  ← 配置有问题: " + err.Error()
@@ -449,11 +598,18 @@ func newEnvShowCmd() *cobra.Command {
 func printEnv(out io.Writer, cfg *config.Config, e *config.Environment, reveal bool) {
 	fmt.Fprintf(out, "环境:     %s\n", e.Name)
 	fmt.Fprintf(out, "类型:     %s\n", e.Type)
-	fmt.Fprintf(out, "架构:     %s\n", orDefault(e.Platform, orDefault(cfg.Defaults.Platform, config.DefaultPlatform)))
+	fmt.Fprintf(out, "架构:     %s\n", envPlatform(cfg, e))
 	if e.Type == config.TypeK8s {
 		fmt.Fprintf(out, "命名空间: %s\n", orDefault(e.ContainerdNamespace, config.DefaultNamespace))
 	}
 	fmt.Fprintf(out, "远程临时: %s\n", orDefault(e.RemoteTmp, orDefault(cfg.Defaults.RemoteTmp, config.DefaultRemoteTmp)))
+	if e.Jump != "" {
+		if n := len(e.Hosts) - 1; n > 0 {
+			fmt.Fprintf(out, "跳板机:   %s (其余 %d 台经它中转)\n", e.Jump, n)
+		} else {
+			fmt.Fprintf(out, "跳板机:   %s\n", e.Jump)
+		}
+	}
 
 	fmt.Fprintf(out, "\n默认账号: %s\n", describeAuth(e.SSH, reveal))
 	if len(e.Hosts) == 0 {

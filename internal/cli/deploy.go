@@ -126,6 +126,9 @@ func (f *deployFlags) confirm(out io.Writer, verb string, targets []*config.Targ
 			addrs = append(addrs, h.Host)
 		}
 		fmt.Fprintf(out, "  %s (%s, %s) → %s\n", t.Name, t.Type, t.Platform, strings.Join(addrs, ", "))
+		if t.NeedsJump() {
+			fmt.Fprintf(out, "    ↳ 除 %s 外, 其余经它中转\n", t.Jump.Host)
+		}
 	}
 
 	ok, err := NewPrompter().Confirm("继续?")
@@ -245,7 +248,19 @@ func newBuildCmd() *cobra.Command {
 				if err := dockercli.BuildxBuild(opts); err != nil {
 					return err
 				}
-				fmt.Fprintln(cmd.OutOrStdout(), "构建完成。")
+				stdout := cmd.OutOrStdout()
+				fmt.Fprintln(stdout, "构建完成。")
+				if outTar != "" {
+					cmdSection(stdout, "拷到目标机后手动导入:", [][2]string{
+						{"docker load -i " + outTar, "docker 机器"},
+						{"ctr -n k8s.io images import " + outTar, "k8s 节点"},
+					})
+					return nil
+				}
+				cmdSection(stdout, "下一步:", [][2]string{
+					{"imgm push -e <环境> " + tag, "分发到已配置的环境"},
+					{"imgm env ls", "查看有哪些环境"},
+				})
 				return nil
 			}
 

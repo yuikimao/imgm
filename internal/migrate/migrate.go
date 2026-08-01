@@ -9,11 +9,16 @@ import (
 	"path"
 	"path/filepath"
 	"strings"
+	"time"
 
 	"imgm/internal/config"
 	"imgm/internal/dockercli"
 	"imgm/internal/remote"
 )
+
+// jumpDialTimeout 是连跳板机本身的超时。比单台机器的默认超时略宽松:
+// 它挂了整个环境都发不了, 值得多等一会儿。
+const jumpDialTimeout = 20 * time.Second
 
 // Obtainer 负责让镜像出现在本机 docker 里 (拉取 / 构建 / 仅校验已存在)。
 // 后续的打包-上传-导入对三种来源完全一致。
@@ -64,18 +69,19 @@ func Deploy(targets []*config.Target, opts Options) (*Report, error) {
 	tars := make(map[string]string, len(targets)) // platform -> 本地 tar
 
 	for _, t := range targets {
-		fmt.Fprintf(out, "\n#### 环境 [%s] type=%s platform=%s 机器数=%d ####\n",
-			t.Name, t.Type, t.Platform, len(t.Hosts))
+		fmt.Fprintf(out, "\n#### 环境 [%s] type=%s platform=%s 机器数=%d", t.Name, t.Type, t.Platform, len(t.Hosts))
+		if t.NeedsJump() {
+			// -y 会跳过确认横幅, 所以路由必须在这里也说一次, 否则脚本用户永远看不到。
+			fmt.Fprintf(out, " jump=%s", t.Jump.Host)
+		}
+		fmt.Fprintln(out, " ####")
 
 		tar, ok := tars[t.Platform]
 		if !ok {
 			tar = filepath.Join(workDir, tarName(t.Platform))
 			if err := prepareTar(out, t, tar, opts); err != nil {
 				fmt.Fprintf(os.Stderr, "!! 环境 [%s] 准备阶段失败, 跳过其所有机器: %v\n", t.Name, err)
-				for _, h := range t.Hosts {
-					rep.HostTotal++
-					rep.Failures = append(rep.Failures, t.Name+"/"+h.Host)
-				}
+				failAllHosts(rep, t)
 				continue
 			}
 			tars[t.Platform] = tar
@@ -83,26 +89,7 @@ func Deploy(targets []*config.Target, opts Options) (*Report, error) {
 			fmt.Fprintf(out, "-- 复用已打好的 %s (同架构)\n", filepath.Base(tar))
 		}
 
-		remoteTar := path.Join(t.RemoteTmp, filepath.Base(tar))
-		importCmd := importCommand(t, remoteTar)
-
-		for _, h := range t.Hosts {
-			rep.HostTotal++
-			fmt.Fprintf(out, "\n-- [%s] 机器 %s@%s:%d\n", t.Name, h.User, h.Host, h.Port)
-			if opts.DryRun {
-				fmt.Fprintf(out, "  [dry-run] 上传 %s -> %s\n", tar, remoteTar)
-				fmt.Fprintf(out, "  [dry-run] 远程执行: %s\n", importCmd)
-				rep.HostOK++
-				continue
-			}
-			if err := deployToHost(out, t, h, tar, remoteTar, importCmd); err != nil {
-				fmt.Fprintf(os.Stderr, "!! [%s/%s] 失败: %v\n", t.Name, h.Host, err)
-				rep.Failures = append(rep.Failures, t.Name+"/"+h.Host)
-				continue
-			}
-			rep.HostOK++
-			fmt.Fprintf(out, "== [%s/%s] 完成 ==\n", t.Name, h.Host)
-		}
+		deployTarget(out, t, tar, opts, rep)
 	}
 
 	fmt.Fprintf(out, "\n#### 汇总: 机器总数 %d, 成功 %d, 失败 %d ####\n",
@@ -117,7 +104,80 @@ func Deploy(targets []*config.Target, opts Options) (*Report, error) {
 	if len(rep.Failures) > 0 {
 		return rep, fmt.Errorf("以下目标失败:\n  - %s", strings.Join(rep.Failures, "\n  - "))
 	}
+	if !opts.DryRun && rep.HostOK > 0 {
+		printVerifyHint(out, targets, opts.Images)
+	}
 	return rep, nil
+}
+
+// printVerifyHint 分发成功后给出在目标机上确认镜像的命令。imgm 不会替用户
+// 去远程查 (对远程机器只有查看权限, 不做额外探测), 但可以告诉他们查什么。
+func printVerifyHint(out io.Writer, targets []*config.Target, images []string) {
+	t := targets[0]
+	check := fmt.Sprintf("docker images %s", images[0])
+	if t.Type == config.TypeK8s {
+		check = fmt.Sprintf("ctr -n %s images ls | grep %s", t.Namespace, images[0])
+	}
+	fmt.Fprintf(out, "\n在目标机上确认: %s\n", check)
+}
+
+// deployTarget 把打好的 tar 发到一个环境的所有机器。
+// 单独成函数是为了让跳板机连接的 defer 在环境结束时就触发, 而不是拖到所有环境跑完。
+func deployTarget(out io.Writer, t *config.Target, tar string, opts Options, rep *Report) {
+	remoteTar := path.Join(t.RemoteTmp, filepath.Base(tar))
+	importCmd := importCommand(t, remoteTar)
+
+	// 整个环境共用一条跳板连接: 每台机器各拨一次会让跳板机短时间内收到
+	// N 次认证, 容易撞上 sshd 的 MaxStartups 或 fail2ban。
+	var via *remote.Jump
+	if t.NeedsJump() && !opts.DryRun {
+		j, err := remote.DialJump(*t.Jump, jumpDialTimeout)
+		if err != nil {
+			fmt.Fprintf(os.Stderr, "!! 环境 [%s] 跳板机不可用, 跳过其所有机器: %v\n", t.Name, err)
+			failAllHosts(rep, t)
+			return
+		}
+		via = j
+		defer via.Close()
+	}
+
+	for _, h := range t.Hosts {
+		rep.HostTotal++
+		fmt.Fprintf(out, "\n-- [%s] 机器 %s@%s:%d", t.Name, h.User, h.Host, h.Port)
+		if t.JumpFor(h) != nil {
+			fmt.Fprintf(out, " (经跳板机 %s)", t.Jump.Host)
+		} else if t.NeedsJump() {
+			fmt.Fprint(out, " (跳板机, 直连)")
+		}
+		fmt.Fprintln(out)
+
+		if opts.DryRun {
+			fmt.Fprintf(out, "  [dry-run] 上传 %s -> %s\n", tar, remoteTar)
+			fmt.Fprintf(out, "  [dry-run] 远程执行: %s\n", importCmd)
+			rep.HostOK++
+			continue
+		}
+		// 跳板机自己走直连 (JumpFor 返回 nil), 不绕着自己兜一圈。
+		hostVia := via
+		if t.JumpFor(h) == nil {
+			hostVia = nil
+		}
+		if err := deployToHost(out, h, hostVia, tar, remoteTar, importCmd); err != nil {
+			fmt.Fprintf(os.Stderr, "!! [%s/%s] 失败: %v\n", t.Name, h.Host, err)
+			rep.Failures = append(rep.Failures, t.Name+"/"+h.Host)
+			continue
+		}
+		rep.HostOK++
+		fmt.Fprintf(out, "== [%s/%s] 完成 ==\n", t.Name, h.Host)
+	}
+}
+
+// failAllHosts 把一个环境的所有机器都记为失败 (准备阶段或跳板机就挂了)。
+func failAllHosts(rep *Report, t *config.Target) {
+	for _, h := range t.Hosts {
+		rep.HostTotal++
+		rep.Failures = append(rep.Failures, t.Name+"/"+h.Host)
+	}
 }
 
 // prepareWorkDir 决定 tar 落盘位置。用户指定了目录就不动它 (也不删里面的文件);
@@ -228,9 +288,10 @@ func LocalObtainer() Obtainer {
 }
 
 // deployToHost 把已打好的 tar 上传到一台机器并执行导入。
+// via 非 nil 时经跳板机中转 (跳板机自己拿到的是 nil, 走直连)。
 // 上传的 tar 会留在远程机器上: 本工具不在别人的机器上删任何文件。
-func deployToHost(out io.Writer, t *config.Target, h config.Host, localTar, remoteTar, importCmd string) error {
-	client, err := remote.Dial(h)
+func deployToHost(out io.Writer, h config.Host, via *remote.Jump, localTar, remoteTar, importCmd string) error {
+	client, err := remote.Dial(h, via)
 	if err != nil {
 		return err
 	}

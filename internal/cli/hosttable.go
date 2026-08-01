@@ -3,6 +3,7 @@ package cli
 import (
 	"fmt"
 	"io"
+	"strings"
 	"text/tabwriter"
 
 	"imgm/internal/config"
@@ -19,12 +20,27 @@ const (
 func (m hostMark) label() string {
 	switch m {
 	case markAdded:
-		return "  ← 新增"
+		return "新增"
 	case markChanged:
-		return "  ← 已改"
+		return "已改"
 	default:
 		return ""
 	}
+}
+
+// noteFor 组合一行的尾注, 如 "  ← 跳板机, 新增"。两种标记可以同时出现。
+func noteFor(isJump bool, m hostMark) string {
+	var parts []string
+	if isJump {
+		parts = append(parts, "跳板机")
+	}
+	if s := m.label(); s != "" {
+		parts = append(parts, s)
+	}
+	if len(parts) == 0 {
+		return ""
+	}
+	return "  ← " + strings.Join(parts, ", ")
 }
 
 type hostTableOpts struct {
@@ -46,7 +62,8 @@ func printHostTable(out io.Writer, cfg *config.Config, e *config.Environment, op
 			KeyFile:  orDefault(h.KeyFile, orDefault(e.SSH.KeyFile, cfg.Defaults.SSH.KeyFile)),
 			Password: orDefault(h.Password, orDefault(e.SSH.Password, cfg.Defaults.SSH.Password)),
 		}, opts.Reveal)
-		fmt.Fprintf(tw, "%s%s\t%d\t%s\t%s%s\n", opts.Indent, h.Host, port, orDefault(user, "-"), auth, opts.Marks[h.Host].label())
+		fmt.Fprintf(tw, "%s%s\t%d\t%s\t%s%s\n", opts.Indent, h.Host, port, orDefault(user, "-"), auth,
+			noteFor(h.Host == e.Jump && e.Jump != "", opts.Marks[h.Host]))
 	}
 	tw.Flush()
 }

@@ -69,22 +69,20 @@ func newEnvCheckCmd() *cobra.Command {
 			if t.Type == config.TypeK8s {
 				fmt.Fprintf(out, "  ns=%s", t.Namespace)
 			}
+			if t.NeedsJump() {
+				fmt.Fprintf(out, "  jump=%s", t.Jump.Host)
+			}
 			fmt.Fprintf(out, "  %d 台机器\n", len(t.Hosts))
 
-			results := make([][]probe, len(t.Hosts))
-			var wg sync.WaitGroup
-			for i, h := range t.Hosts {
-				wg.Add(1)
-				go func(i int, h config.Host) {
-					defer wg.Done()
-					results[i] = checkHost(t, h, timeout)
-				}(i, h)
-			}
-			wg.Wait()
+			results := checkAll(t, timeout)
 
 			ok := 0
 			for i, h := range t.Hosts {
-				fmt.Fprintf(out, "\n%s:%d (%s)\n", h.Host, h.Port, h.User)
+				tag := ""
+				if t.Jump != nil && t.Jump.Host == h.Host {
+					tag = " [跳板机]"
+				}
+				fmt.Fprintf(out, "\n%s:%d (%s)%s\n", h.Host, h.Port, h.User, tag)
 				failed := false
 				for _, p := range results[i] {
 					fmt.Fprintf(out, "  %s %-14s %s\n", p.mark(), p.label, p.detail)
@@ -98,6 +96,7 @@ func newEnvCheckCmd() *cobra.Command {
 			}
 
 			fmt.Fprintf(out, "\n汇总: %d 台, 通过 %d, 失败 %d\n", len(t.Hosts), ok, len(t.Hosts)-ok)
+			fmt.Fprint(out, suggestJump(t, results))
 			if ok < len(t.Hosts) {
 				return fmt.Errorf("环境 %s 有 %d 台机器未通过自检", t.Name, len(t.Hosts)-ok)
 			}
@@ -108,9 +107,85 @@ func newEnvCheckCmd() *cobra.Command {
 	return cmd
 }
 
-func checkHost(t *config.Target, h config.Host, timeout time.Duration) []probe {
+// suggestJump 在「恰好一台连得上、其余全是连不上」时提示跳板机功能的存在。
+// 这个形状几乎只可能是跳板机拓扑, 但 imgm 分不清「要中转」和「那台机器挂了」,
+// 所以只给命令不自动改配置。已经设了跳板机的环境不提示。
+func suggestJump(t *config.Target, results [][]probe) string {
+	if t.Jump != nil || len(t.Hosts) < 2 {
+		return ""
+	}
+	var reachable string
+	unreachable := 0
+	for i, h := range t.Hosts {
+		if !dialFailed(results[i]) {
+			if reachable != "" {
+				return "" // 不止一台连得上, 不像跳板机拓扑
+			}
+			reachable = h.Host
+			continue
+		}
+		unreachable++
+	}
+	if reachable == "" || unreachable == 0 {
+		return ""
+	}
+	return fmt.Sprintf("\nℹ 当前环境为直连模式: 每台机器都从本机直接连接。\n"+
+		"  若其余 %d 台只能经 %s 中转, 设置跳板机:\n"+
+		"      imgm env set %s --jump %s\n"+
+		"  设置后重新验证: imgm env check %s\n",
+		unreachable, reachable, t.Name, reachable, t.Name)
+}
+
+// dialFailed 判断这台是否连都没连上。连上了但 docker 缺失之类的失败不算 ——
+// 那不是拓扑问题, 换成跳板机也救不了。
+func dialFailed(ps []probe) bool {
+	return len(ps) > 0 && ps[0].status == statusFail && ps[0].label == "SSH 连接"
+}
+
+// checkAll 探测环境里所有机器。有跳板机时先单独把它连通, 通了再并行探测
+// 其余机器并共用这一条隧道。
+func checkAll(t *config.Target, timeout time.Duration) [][]probe {
+	results := make([][]probe, len(t.Hosts))
+
+	var via *remote.Jump
+	if t.NeedsJump() {
+		j, err := remote.DialJump(*t.Jump, timeout)
+		if err != nil {
+			// 跳板机不通就别再对其余机器发起 N 个注定失败的连接。
+			// 必须记 statusFail: 汇总只把「没有 statusFail」算通过, 用 warn
+			// 会让 env check 什么都没验证却退出 0。
+			for i, h := range t.Hosts {
+				if h.Host == t.Jump.Host {
+					results[i] = []probe{{statusFail, "SSH 连接", err.Error()}}
+					continue
+				}
+				results[i] = []probe{{statusFail, "跳过", fmt.Sprintf("跳板机 %s 不可用, 无法中转", t.Jump.Host)}}
+			}
+			return results
+		}
+		via = j
+		defer via.Close()
+	}
+
+	var wg sync.WaitGroup
+	for i, h := range t.Hosts {
+		wg.Add(1)
+		go func(i int, h config.Host) {
+			defer wg.Done()
+			hostVia := via
+			if t.JumpFor(h) == nil {
+				hostVia = nil // 跳板机自己走直连
+			}
+			results[i] = checkHost(t, h, hostVia, timeout)
+		}(i, h)
+	}
+	wg.Wait()
+	return results
+}
+
+func checkHost(t *config.Target, h config.Host, via *remote.Jump, timeout time.Duration) []probe {
 	start := time.Now()
-	client, err := remote.DialTimeout(h, timeout)
+	client, err := remote.DialTimeout(h, via, timeout)
 	if err != nil {
 		return []probe{{statusFail, "SSH 连接", err.Error()}}
 	}

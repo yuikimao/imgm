@@ -68,6 +68,20 @@ func (p *Prompter) LineDefault(label, def string) (string, error) {
 	return p.Line(label, def)
 }
 
+// LineOptional 读一行可以为空的文本。Line 在 def 为空时把空输入当「必填」
+// 无限重问, 所以「可留空」的项不能用 Line/LineDefault。非交互环境返回空串。
+func (p *Prompter) LineOptional(label string) (string, error) {
+	if !p.tty {
+		return "", nil
+	}
+	fmt.Fprintf(p.out, "%s: ", label)
+	s, err := p.in.ReadString('\n')
+	if err != nil && s == "" {
+		return "", fmt.Errorf("读取输入失败: %w", err)
+	}
+	return strings.TrimSpace(s), nil
+}
+
 // Int 读一个正整数。
 func (p *Prompter) Int(label string, def int) (int, error) {
 	for {
